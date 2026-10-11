@@ -1,3 +1,4 @@
+
 import { useEffect, useRef, useState } from 'react'
 import './App.css'
 
@@ -10,9 +11,12 @@ type DashboardStats = {
 
 type TokenResponse = {
   access_token?: string
+  refresh_token?: string
   token_type?: string
   expires_in?: number
   message?: string
+  error?: string
+  error_description?: string
 }
 
 const CLIENT_ID = '01a12b7c-1559-732f-a639-7211b225e0ed'
@@ -51,12 +55,14 @@ function App() {
     useState<DashboardStats | null>(null)
 
   const [accessToken, setAccessToken] = useState('')
+  const [refreshToken, setRefreshToken] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
   const callbackStarted = useRef(false)
+  const skipNextFetch = useRef(false)
 
-  // Step 1: Start OAuth Authorization Code + PKCE flow
+  //  OAuth Authorization Code + PKCE flow
   async function signIn() {
     try {
       setLoading(true)
@@ -89,7 +95,7 @@ function App() {
     }
   }
 
-  // Step 2: Exchange authorization code for an access token
+  // Exchange authorization code for tokens
   useEffect(() => {
     if (window.location.pathname !== '/auth/callback') {
       return
@@ -156,7 +162,10 @@ function App() {
 
         if (!response.ok || !tokenData.access_token) {
           throw new Error(
-            tokenData.message ?? 'Failed to obtain access token.',
+            tokenData.error_description ??
+              tokenData.message ??
+              tokenData.error ??
+              'Failed to obtain access token.',
           )
         }
 
@@ -164,6 +173,7 @@ function App() {
         window.history.replaceState({}, document.title, '/')
 
         setAccessToken(tokenData.access_token)
+        setRefreshToken(tokenData.refresh_token ?? '')
       } catch (err) {
         setError(
           err instanceof Error
@@ -178,9 +188,15 @@ function App() {
     void handleCallback()
   }, [])
 
-  // Step 3: Fetch dashboard data using the OAuth access token
+  //  Fetch dashboard data and refresh rejected access tokens
   useEffect(() => {
     if (!accessToken) {
+      return
+    }
+
+    // Avoid an unnecessary second fetch after a successful refresh.
+    if (skipNextFetch.current) {
+      skipNextFetch.current = false
       return
     }
 
@@ -191,31 +207,99 @@ function App() {
         setLoading(true)
         setError('')
 
-        const response = await fetch(
+        let currentAccessToken = accessToken
+
+        let response = await fetch(
           `${API_URL}/api/dashboard/stats`,
           {
             headers: {
               Accept: 'application/json',
-              Authorization: `Bearer ${accessToken}`,
+              Authorization: `Bearer ${currentAccessToken}`,
             },
             signal: controller.signal,
           },
         )
 
-        if (!response.ok) {
-          if (response.status === 401) {
+        if (response.status === 401) {
+          if (!refreshToken) {
             throw new Error(
-              'Authentication failed. Please sign in again.',
+              'Session expired. Please sign in again.',
             )
           }
 
+          // Request new tokens using the refresh token.
+          const refreshResponse = await fetch(
+            `${API_URL}/oauth/token`,
+            {
+              method: 'POST',
+              headers: {
+                Accept: 'application/json',
+                'Content-Type':
+                  'application/x-www-form-urlencoded',
+              },
+              body: new URLSearchParams({
+                grant_type: 'refresh_token',
+                client_id: CLIENT_ID,
+                refresh_token: refreshToken,
+              }),
+              signal: controller.signal,
+            },
+          )
+
+          const refreshedData: TokenResponse =
+            await refreshResponse.json()
+
+          if (
+            !refreshResponse.ok ||
+            !refreshedData.access_token
+          ) {
+            throw new Error(
+              refreshedData.error_description ??
+                refreshedData.message ??
+                refreshedData.error ??
+                'Unable to refresh the session. Please sign in again.',
+            )
+          }
+
+          currentAccessToken = refreshedData.access_token
+
+          // Retry the original API request once.
+          response = await fetch(
+            `${API_URL}/api/dashboard/stats`,
+            {
+              headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${currentAccessToken}`,
+              },
+              signal: controller.signal,
+            },
+          )
+
+          if (!response.ok) {
+            throw new Error(
+              `Dashboard request failed (HTTP ${response.status}).`,
+            )
+          }
+
+          const data: DashboardStats = await response.json()
+
+          setDashboardStats(data)
+
+          // Keep the latest tokens in memory.
+          setRefreshToken(refreshedData.refresh_token ?? '')
+          skipNextFetch.current = true
+          setAccessToken(refreshedData.access_token)
+
+          return
+        }
+
+        if (!response.ok) {
           throw new Error(
             `Failed to load dashboard (HTTP ${response.status}).`,
           )
         }
 
         const data: DashboardStats = await response.json()
-
         setDashboardStats(data)
       } catch (err) {
         if (err instanceof Error && err.name === 'AbortError') {
